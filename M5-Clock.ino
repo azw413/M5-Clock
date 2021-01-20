@@ -19,8 +19,9 @@ float tem;
 float outside_temp;
 float hum;
 
-int16_t low_temp = 0, high_temp = 0, outdoor_temp = -2000;
+int16_t last_temp = 0, low_temp = 0, high_temp = 0, outdoor_temp = -2000;
 int nvr_save = 0;
+int cleared = 0;
 
 int count = 1;
 rtc_time_t current_time;
@@ -28,7 +29,7 @@ rtc_time_t current_time;
 char * days[] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
 char * month[] = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
 
-M5EPD_Canvas canvas(&M5.EPD);
+M5EPD_Canvas unused_canvas(&M5.EPD);
 
 
 /* After M5.shutdown( secs ), the whole sketch restarts so it will reenter setup - just like a reboot.  
@@ -45,28 +46,37 @@ void setup()
 
 
     // It seems that you can't have serial on and EPD display updating :( 
-    //Serial.begin(9600); 
+    //Serial.begin(9600);
+    Serial.print("\nM5-Clock started.\n"); 
     
     M5.SHT30.Begin();
     M5.RTC.begin();
 
+    M5.RTC.getTime(&current_time);
+
+    M5.EPD.SetRotation(0);
+    M5.TP.SetRotation(0);
+    
+    if (current_time.min == 0) // Clean the display once an hour 
+    {
+       // Clear the display
+       M5.EPD.Clear(true); 
+       cleared = 1;
+    }
+    
+    unused_canvas.createCanvas(960, 540);    
+    
     if (!SPIFFS.begin(true))
     {
         log_e("SPIFFS Mount Failed");
         while(1);
     }
 
-    M5.RTC.getTime(&current_time);
-
-    M5.EPD.SetRotation(0);
-    M5.TP.SetRotation(0);
-    if (current_time.min % 5 == 0) M5.EPD.Clear(true);
-    canvas.createCanvas(960, 540);    
-
-    // I did try the SD card but couldn't get it to work :( 
-    canvas.loadFont("/liquid-crystal.ttf", SPIFFS); // Load font files internal flash
+    unused_canvas.loadFont("/liquid-crystal.ttf", SPIFFS); // Load font files internal flash
+    unused_canvas.createRender(120);
+    unused_canvas.createRender(48);
+    unused_canvas.createRender(32);
     
-    Serial.print("M5-Clock started.");
 }
 
 
@@ -75,6 +85,7 @@ void load_persistent_data(void)
     // Load our 3 state variables from NVS
     nvs_handle nvs_arg;
     nvs_open("M5-Clock", NVS_READONLY, &nvs_arg);
+    nvs_get_i16(nvs_arg, "last_temp", &last_temp);
     nvs_get_i16(nvs_arg, "low_temp", &low_temp);
     nvs_get_i16(nvs_arg, "high_temp", &high_temp);
     nvs_get_i16(nvs_arg, "outdoor_temp", &outdoor_temp);
@@ -86,6 +97,7 @@ void save_persistent_data(void)
     // Save our 3 state variables - used sparingly to avoid wear on the flash
     nvs_handle nvs_arg;
     nvs_open("M5-Clock", NVS_READWRITE, &nvs_arg);
+    nvs_set_i16(nvs_arg, "last_temp", last_temp);
     nvs_set_i16(nvs_arg, "low_temp", low_temp);
     nvs_set_i16(nvs_arg, "high_temp", high_temp);
     nvs_set_i16(nvs_arg, "outdoor_temp", outdoor_temp);
@@ -102,6 +114,21 @@ int dayofweek(int y, int m, int d)
      return (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7;
 }
 
+void render_text(int x, int y, int font_size, char * text)
+{
+   int width = strlen(text) * font_size / 2;  // Estimate width of canvas
+   int height = font_size;
+
+   M5EPD_Canvas canvas(&M5.EPD);
+   canvas.createCanvas(width, height);
+
+   canvas.setTextSize(font_size);
+   canvas.setTextDatum(TC_DATUM);
+   canvas.drawString(text, width / 2, 0);
+
+   canvas.pushCanvas(x, y, UPDATE_MODE_GC16);
+}
+
 void render_time()
 {
     // Display Time
@@ -109,48 +136,29 @@ void render_time()
     char dateString[64];
     
     M5.RTC.getTime(&current_time);
-
     sprintf(timeString, " %02d:%02d ", current_time.hour, current_time.min);
+    render_text(280, 180, 120, timeString);
 
-    // createRender appears to be necessary to generate the font once for each point size - some docs would be nice.
-    canvas.createRender(120);
-    canvas.setTextSize(120);
-    canvas.setTextDatum(TC_DATUM);
-    canvas.drawString(timeString, 480, 180);
 
-    // Display Date
-    rtc_date_t current_date;
-    M5.RTC.getDate(&current_date);
+    // Display Date - once an hour
+    if (cleared || (current_time.min == 0)) 
+    {
+       rtc_date_t current_date;
+       M5.RTC.getDate(&current_date);
 
-    char * day = days[dayofweek(current_date.year, current_date.mon, current_date.day)];
+       int dow = dayofweek(current_date.year, current_date.mon, current_date.day);
+   
+       char * day = "Error";
+       if ((dow >=0 ) && (dow <= 6)) day = days[dow];
 
-    sprintf(dateString, "  %s %2dth %s %4d  ", day, current_date.day, month[current_date.mon-1], current_date.year);
-    canvas.createRender(48);
-    canvas.setTextSize(48);
-    canvas.setTextDatum(TC_DATUM);
-    canvas.drawString(dateString, 480, 320);
-
+       sprintf(dateString, "  %s %2dth %s %4d  ", day, current_date.day, month[current_date.mon-1], current_date.year);
+       render_text(110, 330, 48, dateString);
+    }  
 }
 
 
 void sleep_for_a_minute()
-{
-    /*
-     * I tried the shutdown(&rtc_time_t) but it doesn't seem to work - please can we have some docs and more examples
-     * 
-    current_time.sec = 0;
-    current_time.min++;
-    if (current_time.min == 60)
-    {
-       current_time.min = 0;
-       current_time.hour++;
-       if (current_time.hour == 24)
-       {
-          current_time.hour == 0; 
-       }
-    }
-    */
-    
+{   
     // Calculate remaining minute and shutdown for that.
     M5.RTC.getTime(&current_time);
     int sleep_period = 60 - current_time.sec; 
@@ -257,9 +265,13 @@ void get_weather()
            strcat(url128, p);
            strcat(url, url128); 
         }
-        
+
+        // Update the weather image
         Serial.printf("Weather image: %s\n", url);
-        canvas.drawPngUrl(url, 160, 420, 128, 128);  
+        M5EPD_Canvas canvas(&M5.EPD);
+        canvas.createCanvas(128, 128);
+        canvas.drawPngUrl(url, 0, 0, 128, 128);
+        canvas.pushCanvas(140, 405, UPDATE_MODE_GC16);
         
       }
       else {
@@ -285,71 +297,93 @@ void loop()
     tem = M5.SHT30.GetTemperature();
     hum = M5.SHT30.GetRelHumidity();
 
-    uint32_t battery = M5.getBatteryVoltage();
-    if (battery < 3200) strcpy(msg, "Chrg");
-    else sprintf(msg, "%1.1fv", (float) battery / 1000.0);
+    // Update the battery voltage every 5 mins
+    //if (cleared || (current_time.min % 5 == 0)) 
+    {
+       uint32_t battery = M5.getBatteryVoltage();
+       if (battery < 3200) strcpy(msg, "Chrg");
+       else sprintf(msg, "%1.1fv", (float) battery / 1000.0);
+       render_text(890, 5, 32, msg);
+
+       if (battery < 3.1) 
+       {
+          // No battery - shutdown
+          M5.EPD.Clear(true); 
+          render_text(360, 220, 48, "No Battery !");
+          M5.shutdown(); 
+       }
+
+       if (battery < 3.3)
+       {
+          render_text(360, 100, 48, "Low Battery"); 
+       }
+    }
+
+    int16_t int_temp = (int16_t) (tem * 10.0);
 
     if ((low_temp == 0) && (high_temp == 0)) 
     {
       load_persistent_data(); 
     }
 
-    int16_t int_temp = (int16_t) (tem * 10.0);
 
-    if (((low_temp == 0) && (high_temp == 0)) || ((current_time.hour == 0) && (current_time.min == 0))) // Load NVR failed or new day
+    // Current temperature
+    if (((int_temp != last_temp) || cleared || ((current_time.hour == 0) && (current_time.min == 0))))
     {
-      low_temp = int_temp;
-      high_temp = int_temp;
-      nvr_save = 1; 
+        // Update the temperature
+        sprintf(msg, "%2.1fC", tem);
+        render_text(5, 5, 48, msg);
+        last_temp = int_temp;
+
+        int hi_lo_changes = 0;
+     
+        if (((low_temp == 0) && (high_temp == 0)) || ((current_time.hour == 0) && (current_time.min == 0))) // Load NVR failed or new day
+        {
+           low_temp = int_temp;
+           high_temp = int_temp;
+           hi_lo_changes = 1; 
+        }
+
+        if (int_temp > high_temp) 
+        {
+           high_temp = int_temp;
+           hi_lo_changes = 1;
+        }
+
+        if (int_temp < low_temp) 
+        {
+           low_temp = int_temp;
+           hi_lo_changes = 1;
+        }
+
+        // High and low temps have changed
+        if ((hi_lo_changes) || cleared) 
+        { 
+           sprintf(msg, "%2.1fC  %2.1fC", (float) low_temp / 10.0, (float) high_temp / 10.0);
+           render_text(130, 5, 32, msg);
+        }
+
+        nvr_save = 1;
     }
-
-    if (int_temp > high_temp) 
-    {
-       high_temp = int_temp;
-       nvr_save = 1;
-    }
-
-    if (int_temp < low_temp) 
-    {
-       low_temp = int_temp;
-       nvr_save = 1;
-    }
-
-    
-    canvas.createRender(32);
-    canvas.setTextSize(32);
-    canvas.setTextDatum(TC_DATUM);
-    canvas.drawString(msg, 920, 5);
-
-    sprintf(msg, "%2.1fC", tem);
-    canvas.setTextSize(48);
-    canvas.setTextDatum(TC_DATUM);
-    canvas.drawString(msg, 70, 5);
-
-    // High and low temps
-    sprintf(msg, "%2.1fC  %2.1fC", (float) low_temp / 10.0, (float) high_temp / 10.0);
-    canvas.setTextSize(32);
-    canvas.setTextDatum(TC_DATUM);
-    canvas.drawString(msg, 240, 10);
-
-    // Update the weather every 15 minutes
-    if (current_time.min % 15 == 0)
-    {
-       // get_weather will be slow so push what we have for now
-       canvas.pushCanvas(0,0,UPDATE_MODE_A2); 
-       get_weather();
-    }
-
-    sprintf(msg, "%2.1fC", (float) outdoor_temp / 10.0);
-    canvas.setTextSize(48);
-    canvas.setTextDatum(TC_DATUM);
-    canvas.drawString(msg, 70, 480);
-
-    if (nvr_save) save_persistent_data();
-    canvas.pushCanvas(0,0,UPDATE_MODE_GC16);
     
     delay(500);
-
-    sleep_for_a_minute();
     
+    // Update the weather every 30 minutes
+    if (cleared || (current_time.min % 30 == 0))
+    {
+       // get_weather will be slow so push what we have for now
+       sprintf(msg, "%2.1fC", (float) outdoor_temp / 10.0);
+       render_text(5, 475, 48, msg);
+       
+       get_weather();
+
+       // Temp has probably changed
+       sprintf(msg, "%2.1fC", (float) outdoor_temp / 10.0);
+       render_text(5, 475, 48, msg);
+    }
+
+
+    if (nvr_save) save_persistent_data();
+    
+    sleep_for_a_minute();
 }
