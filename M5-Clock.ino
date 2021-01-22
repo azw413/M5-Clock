@@ -20,12 +20,15 @@ float outside_temp;
 float hum;
 
 int16_t last_temp = 0, low_temp = 0, high_temp = 0, outdoor_temp = -2000;
+int16_t last_weather = 0;
+int16_t forced_shutdown = 0;
 int nvr_save = 0;
 int cleared = 0;
 
 int count = 1;
 rtc_time_t current_time;
 
+char * ord[] = { "st", "nd", "rd", "th" };
 char * days[] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
 char * month[] = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
 
@@ -38,15 +41,27 @@ M5EPD_Canvas unused_canvas(&M5.EPD);
  * This platform needs some serious work.
  */
 
-void setup()
+
+
+void load_persistent_data(void)
 {
- 
-    
-    M5.begin();
+    // Load our 3 state variables from NVS
+    nvs_handle nvs_arg;
+    nvs_open("M5-Clock", NVS_READONLY, &nvs_arg);
+    nvs_get_i16(nvs_arg, "last_temp", &last_temp);
+    nvs_get_i16(nvs_arg, "low_temp", &low_temp);
+    nvs_get_i16(nvs_arg, "high_temp", &high_temp);
+    nvs_get_i16(nvs_arg, "outdoor_temp", &outdoor_temp);
+    nvs_get_i16(nvs_arg, "last_weather", &last_weather);
+    nvs_get_i16(nvs_arg, "forced_shutdown", &forced_shutdown);
+    nvs_close(nvs_arg);
+}
 
+void setup()
+{    
+    M5.begin(false, false, true, true, false);
 
-    // It seems that you can't have serial on and EPD display updating :( 
-    //Serial.begin(9600);
+    // Serial is initialised by M5.begin to 115200 baud
     Serial.print("\nM5-Clock started.\n"); 
     
     M5.SHT30.Begin();
@@ -56,12 +71,20 @@ void setup()
 
     M5.EPD.SetRotation(0);
     M5.TP.SetRotation(0);
+
+    load_persistent_data();
     
-    if (current_time.min == 0) // Clean the display once an hour 
+    if ((current_time.min == 0) || forced_shutdown) // Clean the display once an hour 
     {
        // Clear the display
        M5.EPD.Clear(true); 
        cleared = 1;
+
+       if (forced_shutdown)
+       {
+          forced_shutdown = 0;
+          nvr_save = 1; 
+       }
     }
     
     unused_canvas.createCanvas(960, 540);    
@@ -79,19 +102,6 @@ void setup()
     
 }
 
-
-void load_persistent_data(void)
-{
-    // Load our 3 state variables from NVS
-    nvs_handle nvs_arg;
-    nvs_open("M5-Clock", NVS_READONLY, &nvs_arg);
-    nvs_get_i16(nvs_arg, "last_temp", &last_temp);
-    nvs_get_i16(nvs_arg, "low_temp", &low_temp);
-    nvs_get_i16(nvs_arg, "high_temp", &high_temp);
-    nvs_get_i16(nvs_arg, "outdoor_temp", &outdoor_temp);
-    nvs_close(nvs_arg);
-}
-
 void save_persistent_data(void)
 {
     // Save our 3 state variables - used sparingly to avoid wear on the flash
@@ -101,6 +111,8 @@ void save_persistent_data(void)
     nvs_set_i16(nvs_arg, "low_temp", low_temp);
     nvs_set_i16(nvs_arg, "high_temp", high_temp);
     nvs_set_i16(nvs_arg, "outdoor_temp", outdoor_temp);
+    nvs_set_i16(nvs_arg, "last_weather", last_weather);
+    nvs_set_i16(nvs_arg, "forced_shutdown", forced_shutdown); 
     nvs_close(nvs_arg);
 }
 
@@ -137,7 +149,8 @@ void render_time()
     
     M5.RTC.getTime(&current_time);
     sprintf(timeString, " %02d:%02d ", current_time.hour, current_time.min);
-    render_text(280, 180, 120, timeString);
+    render_text(280, 160, 120, timeString);
+    Serial.printf("Time rendered\n");
 
 
     // Display Date - once an hour
@@ -151,8 +164,12 @@ void render_time()
        char * day = "Error";
        if ((dow >=0 ) && (dow <= 6)) day = days[dow];
 
-       sprintf(dateString, "  %s %2dth %s %4d  ", day, current_date.day, month[current_date.mon-1], current_date.year);
-       render_text(110, 330, 48, dateString);
+       int o = current_date.day % 10;
+       if (o > 4) o = 4;
+
+       sprintf(dateString, "  %s %2d%s %s %4d  ", day, current_date.day, ord[o-1], month[current_date.mon-1], current_date.year);
+       render_text(110, 310, 48, dateString);
+       Serial.printf("Date rendered\n");
     }  
 }
 
@@ -188,6 +205,7 @@ bool sync_ntp_time(void)
         date_struct.day = timeInfo.tm_mday;
         date_struct.year = timeInfo.tm_year + 1900;
         M5.RTC.setDate(&date_struct);
+        Serial.print("Time synced\n");
         return 1;
     }
     log_d("Time Sync failed");
@@ -195,9 +213,78 @@ bool sync_ntp_time(void)
 }
 
 
+int fetch_weather_image(char * url, char * file_name)
+{        
+        HTTPClient http;
+        
+        // Cheekily get a larger image by replacing 64x64 with 128x128  :)
+        char url128[128];
+        char * p = strstr(url, "64x64");
+        if (p)
+        {
+           p[0] = 0;
+           p+=5;
+           strcpy(url128, "128x128");
+           strcat(url128, p);
+           strcat(url, url128); 
+        }
+
+        // Retrieve the weather image
+        Serial.printf("Fetching weather image: %s\n", url);
+        http.begin(url);
+        int httpResponseCode = http.GET();
+        if (httpResponseCode > 0) 
+        {
+           Serial.print("HTTP Response code: ");
+           Serial.println(httpResponseCode);
+           int len = http.getSize();
+           if (len > 0)
+           {
+              // create buffer for read
+              uint8_t buff[128] = { 0 };
+
+              Serial.printf("Fetching weather image (%d bytes)\n", len);
+
+              File file = SPIFFS.open(file_name, FILE_WRITE);
+
+              // get tcp stream
+              WiFiClient * stream = http.getStreamPtr();
+
+              // read all data from server
+              while(http.connected() && (len > 0 || len == -1)) 
+              {
+                  // get available data size
+                  size_t size = stream->available();
+                  if(size) 
+                  {
+                     // read up to 128 byte
+                     int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+                     // write it to Serial
+                     //Serial.write(buff, c);
+                     file.write(buff, c);
+                     if(len > 0) len -= c;
+                  }
+              }
+              delay(1);
+              file.close();
+
+              if (len == 0) Serial.printf("Weather image fetched successfully.\n");
+              else return 0;
+           }
+           else return 0; // fail
+        }
+        else return 0; // fail 
+        
+        http.end();
+        return 1; // success
+}
+
+
 void get_weather()
 {
     char url[512];
+    char file_name[32];
+    uint16_t image_number = 0;
     
     WiFi.begin(wifi_ssid, wifi_password);
     int wifi_count = 0;
@@ -213,6 +300,7 @@ void get_weather()
       Serial.print("\nWifi connect timed-out - abandoning weather\n");
       return;
     }
+    Serial.print("Wifi connected\n");
 
     // Might as well since we're connected.
     sync_ntp_time();
@@ -229,6 +317,7 @@ void get_weather()
         Serial.println(httpResponseCode);
         String payload = http.getString();
         Serial.println(payload);
+        http.end();
 
         // Parse json
         StaticJsonDocument<1100> doc;
@@ -241,6 +330,10 @@ void get_weather()
 
         outside_temp = doc["current"]["temp_c"];
         const char * image = doc["current"]["condition"]["icon"];
+        
+        // Construct the weather image URL
+        strcpy(url, "https:");
+        strcat(url, image);
 
         int16_t new_outdoor_temp = (int16_t) (outside_temp * 10.0);
         if (new_outdoor_temp != outdoor_temp) 
@@ -249,29 +342,50 @@ void get_weather()
            nvr_save = 1;  
         }
 
-        // Construct the weather image URL
-        strcpy(url, "https:");
-        strcat(url, image);
-        Serial.printf("Weather image: %s\n", url);
-        
-        // Cheekily get a larger image by replacing 64x64 with 128x128  :)
-        char url128[128];
-        char * p = strstr(url, "64x64");
-        if (p)
+        // Construct the file name
+        char fn[32];
+        char * d = strstr(url, "day/");
+        if (d) // It's a day time image
         {
-           p[0] = 0;
-           p+=5;
-           strcpy(url128, "128x128");
-           strcat(url128, p);
-           strcat(url, url128); 
+           d += 4;
+           strcpy(fn, d);
+           fn[3] = 0;
+           image_number = atoi(fn) + 1000;
+           Serial.printf("image: %d\n", image_number);
+        }
+        else  // Night image
+        {
+           d = strstr(url, "night/");
+           if (d) 
+           {
+              d += 6;
+              strcpy(fn, d);
+              fn[3] = 0;
+              image_number = atoi(fn) + 2000;
+           }
         }
 
-        // Update the weather image
-        Serial.printf("Weather image: %s\n", url);
-        M5EPD_Canvas canvas(&M5.EPD);
-        canvas.createCanvas(128, 128);
-        canvas.drawPngUrl(url, 0, 0, 128, 128);
-        canvas.pushCanvas(140, 405, UPDATE_MODE_GC16);
+        if (image_number > 0)
+        {
+           if (last_weather != image_number) 
+           {
+               last_weather = image_number;
+               nvr_save = 1;  
+           
+               // Construct filename
+               sprintf(file_name, "/%d.png", image_number);
+               Serial.printf("Weather image file: %s\n", file_name);
+
+               if (!SPIFFS.exists(file_name)) fetch_weather_image(url, file_name);
+
+               // Update the weather image   
+               M5EPD_Canvas canvas(&M5.EPD);
+               canvas.createCanvas(128, 128);
+               canvas.drawPngFile(SPIFFS, file_name, 0, 0, 128, 128);
+               canvas.pushCanvas(140, 405, UPDATE_MODE_GC16);
+               Serial.printf("Weather image pushed to display\n"); 
+           }
+        }
         
       }
       else {
@@ -279,8 +393,6 @@ void get_weather()
         Serial.println(httpResponseCode);
       }
       
-      // Free resources
-      http.end();
 }
 
 
@@ -301,31 +413,34 @@ void loop()
     //if (cleared || (current_time.min % 5 == 0)) 
     {
        uint32_t battery = M5.getBatteryVoltage();
-       if (battery < 3200) strcpy(msg, "Chrg");
-       else sprintf(msg, "%1.1fv", (float) battery / 1000.0);
+       sprintf(msg, "%1.1fv", (float) battery / 1000.0);
        render_text(890, 5, 32, msg);
 
-       if (battery < 3.1) 
+       if (battery < 3200) 
        {
           // No battery - shutdown
           M5.EPD.Clear(true); 
-          render_text(360, 220, 48, "No Battery !");
+          render_text(360, 200, 48, "No Battery !");
+          forced_shutdown = 1;
+          save_persistent_data();
+          delay(500);
           M5.shutdown(); 
        }
 
-       if (battery < 3.3)
+       if (battery < 3400)
        {
-          render_text(360, 100, 48, "Low Battery"); 
+          render_text(360, 80, 48, "Low Battery"); 
        }
     }
 
     int16_t int_temp = (int16_t) (tem * 10.0);
 
+/*
     if ((low_temp == 0) && (high_temp == 0)) 
     {
       load_persistent_data(); 
     }
-
+*/
 
     // Current temperature
     if (((int_temp != last_temp) || cleared || ((current_time.hour == 0) && (current_time.min == 0))))
@@ -371,10 +486,6 @@ void loop()
     // Update the weather every 30 minutes
     if (cleared || (current_time.min % 30 == 0))
     {
-       // get_weather will be slow so push what we have for now
-       sprintf(msg, "%2.1fC", (float) outdoor_temp / 10.0);
-       render_text(5, 475, 48, msg);
-       
        get_weather();
 
        // Temp has probably changed
